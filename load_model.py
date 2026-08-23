@@ -71,8 +71,13 @@ print(f"KV cache: {bps/1024:.2f} KiB/token")
 with torch.inference_mode():
     out=model(
         **inputs,
-        use_cache=True
+        use_cache=True,
+        logits_to_keep=1
     )
+print("logits shape:",out.logits.shape)
+logits_bytes=out.logits.numel()*out.logits.element_size()
+print("logits bytes:",logits_bytes)
+print("logits mb:",logits_bytes/1e6)
 print("type of past_key_values:",type(out.past_key_values))
 print("DynamicCache attributes:")
 print(dir(out.past_key_values))
