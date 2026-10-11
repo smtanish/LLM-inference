@@ -1,0 +1,579 @@
+#load model.py
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+model_name="Qwen/Qwen2.5-0.5B-Instruct"
+tokenizer=AutoTokenizer.from_pretrained(model_name)
+model=AutoModelForCausalLM.from_pretrained(
+    model_name,
+    dtype=torch.float16,
+    device_map="cuda"
+)
+model.eval()
+print("model loaded")
+memory_baseline=torch.cuda.memory_allocated() / 1e9
+print(f"Memory allocated:{memory_baseline:.3f} gb")
+messages=[
+    {
+        "role":"user",
+        "content":"explain machine learning in one sentence."
+    }
+]
+text=tokenizer.apply_chat_template(
+    messages,
+    tokenize=False,
+    add_generation_prompt=True
+)
+print(text)
+inputs=tokenizer(
+    text,
+    return_tensors="pt"
+)
+inputs=inputs.to(model.device)
+print("input IDs shape:",inputs["input_ids"].shape)
+torch.cuda.reset_peak_memory_stats()
+with torch.inference_mode():
+    outputs=model.generate(
+        **inputs, 
+        max_new_tokens=50, 
+        do_sample=False
+    )
+input_length=inputs["input_ids"].shape[1]
+generated_tokens=outputs[0][input_length:]
+response=tokenizer.decode(
+    generated_tokens,
+    skip_special_tokens=True
+)
+print(response)
+peak_memory=torch.cuda.max_memory_allocated() /1e9
+extra_memory=peak_memory-memory_baseline
+print(f"peak gpu memory:{peak_memory:.3f}gb")
+print(f"extra memory :{extra_memory:.3f}gb")
+print(model.config)
+L=model.config.num_hidden_layers
+H=model.config.num_attention_heads
+hidden_size=model.config.hidden_size
+H_kv=model.config.num_key_value_heads
+vocab_size=model.config.vocab_size
+head_dim=hidden_size//H
+print(f"num_hidden_layers: {L}")
+print(f"num_attention_heads: {H}")
+print(f"num_key_value_heads: {H_kv}")
+print(f"hidden_size: {hidden_size}")
+print(f"vocab_size: {vocab_size}")
+print(f"derived head_dim: {head_dim}")
+if hasattr(model.config, "head_dim"):
+    print(f"config head_dim:{model.config.head_dim}")
+    print(f"head_dim agrees:{head_dim == model.config.head_dim}")
+else:
+    print("Config does not expose head_dim; derived value is:",head_dim)
+bps=2*L*H_kv*head_dim*2
+print(f"KV cache: {bps} bytes/token")
+print(f"KV cache: {bps/1024:.2f} KiB/token")
+with torch.inference_mode():
+    out=model(
+        **inputs,
+        use_cache=True,
+        logits_to_keep=1
+    )
+print("logits shape:",out.logits.shape)
+logits_bytes=out.logits.numel()*out.logits.element_size()
+print("logits bytes:",logits_bytes)
+print("logits mb:",logits_bytes/1e6)
+print("type of past_key_values:",type(out.past_key_values))
+print("DynamicCache attributes:")
+print(dir(out.past_key_values))
+print("number of cache layers:",len(out.past_key_values.layers))
+layer0=out.past_key_values.layers[0]
+print("layer 0 type",type(layer0))
+print("layer 0 attributes:")
+print(dir(layer0))
+print("cache sequence length:",out.past_key_values.get_seq_length())
+key0=layer0.keys 
+value0=layer0.values 
+print("layer 0 key shape",key0.shape)
+print("layer 0 value shape",value0.shape)
+print(
+    "kv heads match config check:",
+    key0.shape[1]==model.config.num_key_value_heads
+)
+total_kv_bytes=0
+for layer in out.past_key_values.layers:
+    total_kv_bytes+=layer.keys.numel()*layer.keys.element_size()
+    total_kv_bytes+=layer.values.numel()*layer.values.element_size()
+seq_len=out.past_key_values.get_seq_length()
+measured_bpt=total_kv_bytes/seq_len
+print("total kv bytes:",total_kv_bytes)
+print("measured bpt:",measured_bpt)
+print(f"measured KV KiB/token: {measured_bpt / 1024:.2f}")
+print("logits shape:",out.logits.shape)
+logits_bytes=out.logits.numel()*out.logits.element_size()
+print("logits bytes:",logits_bytes)
+print(f"logits KiB: {logits_bytes/1e6:.3f} MB")
+gqa=H/H_kv
+print("GQA ratio:",gqa,"x")
+mha_bps=2*L*H*head_dim*2
+print(f"kv cache without gqa:{mha_bps}bytes/token")
+print(f"kv cache without gqa:{mha_bps/1024:.2f} KiB/token")
+gpu_memory=8e9
+gqa_tokens=gpu_memory/bps
+mha_tokens=gpu_memory/mha_bps
+print(f"GQA capacity:{gqa_tokens:.0f} tokens")
+print(f"MHA capacity:{mha_tokens:.0f} tokens")
+print(f"capacity multiplier {gqa_tokens/mha_tokens:.1f}x")
+
+
+#naive_decode.py
+import torch
+from transformers import AutoTokenizer,AutoModelForCausalLM
+import time
+import matplotlib.pyplot as plt 
+model_name="Qwen/Qwen2.5-0.5B-Instruct"
+tokenizer=AutoTokenizer.from_pretrained(model_name)
+model=AutoModelForCausalLM.from_pretrained(
+    model_name,
+    dtype=torch.float16,
+    device_map="cuda"
+)
+model.eval()
+print("model loaded")
+def naive_decode(prompt,max_new_tokens):
+    messages=[
+        {
+            "role":"user",
+            "content":prompt,
+        }
+    ]
+    text=tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+    inputs=tokenizer(
+        text,
+        return_tensors="pt"
+    )
+    input_ids=inputs["input_ids"].to(model.device)
+    for _ in range(3):
+        with torch.inference_mode():
+            model(
+                input_ids=input_ids,
+                use_cache=False,
+                logits_to_keep=1
+            )
+    generated_tokens=[]
+    eos_token_ids=model.generation_config.eos_token_id
+    if isinstance(eos_token_ids,int):
+        eos_token_ids=[eos_token_ids]
+    latencies=[]
+    sequence_lengths=[]
+    for step in range(max_new_tokens):
+        torch.cuda.synchronize()
+        t0=time.perf_counter()
+        with torch.inference_mode():
+            outputs=model(
+                input_ids=input_ids,
+                use_cache=False,
+                logits_to_keep=1
+            )
+        torch.cuda.synchronize()
+        t1=time.perf_counter()
+        latencies.append((t1-t0)*1000)
+        sequence_lengths.append(input_ids.shape[1])
+        logits=outputs.logits[:,-1,:]
+        next_token=torch.argmax(
+            logits,
+            dim=-1,
+            keepdim=True
+        )
+        generated_tokens.append(next_token.item())
+        if next_token.item() in eos_token_ids:
+            break
+        input_ids=torch.cat(
+            [input_ids,next_token],
+            dim=1
+        )
+    response=tokenizer.decode(
+        generated_tokens,
+        skip_special_tokens=True
+    )
+    print(response)
+    return generated_tokens,latencies,sequence_lengths
+prompt="explain machine learning in one sentence."
+manual_tokens,manual_latencies,manual_sequence_lengths=naive_decode(prompt,50)
+print("Latency measurements:",len(manual_latencies))
+print("Sequence lengths:",len(manual_sequence_lengths))
+plt.plot(manual_latencies)
+plt.xlabel("decoding step")
+plt.ylabel("latency(ms)")
+plt.title("naive decoding: latency vs step")
+plt.show()
+print("step 0 latency: ",manual_latencies[0],"ms")
+print("step 29 latency: ",manual_latencies[29],"ms")
+print("step 29/step 0 ratio:",manual_latencies[29]/manual_latencies[0])
+total_time=sum(manual_latencies)/1000
+tokens_per_sec=len(manual_latencies)/total_time
+print("total uncached time: ",total_time,"sec")
+print("total uncached tokens/second: ",tokens_per_sec)
+messages=[
+    {
+        "role":"user",
+        "content":prompt,
+    }
+]
+text=tokenizer.apply_chat_template(
+    messages,
+    tokenize=False,
+    add_generation_prompt=True
+)
+inputs=tokenizer(
+    text,
+    return_tensors="pt"
+)
+inputs=inputs.to(model.device)
+with torch.inference_mode():
+    hf_output=model.generate(
+        **inputs,
+        max_new_tokens=50,
+        do_sample=False,
+        use_cache=False,
+        repetition_penalty=1.0
+    )
+input_length=inputs["input_ids"].shape[1]
+hf_tokens=hf_output[0][input_length:].tolist()
+print("Manual tokens:",manual_tokens)
+print("HF tokens:    ",hf_tokens)
+print("Tokens match:",manual_tokens==hf_tokens)
+torch.cuda.synchronize()
+t0=time.perf_counter()
+with torch.inference_mode():
+    cached_output=model.generate(
+        **inputs,
+        max_new_tokens=50,
+        do_sample=False,
+        use_cache=True,
+        repetition_penalty=1.0
+    )
+torch.cuda.synchronize()
+t1=time.perf_counter()
+cached_time=(t1-t0)
+cached_tokens=cached_output.shape[1]-input_length
+cached_tokens_per_sec=cached_tokens/cached_time
+print("total cached time(sec)",cached_time)
+print("cached tokens/second",cached_tokens_per_sec)
+base_inputs=tokenizer(
+    "explain machine learning in one sentence.",
+    return_tensors="pt"
+).to(model.device)
+
+batch_sizes=[1,2,4,8,16,32,64,128,256]
+
+for batch_size in batch_sizes:
+    input_ids=base_inputs["input_ids"].repeat(batch_size,1)
+
+    for _ in range(5):
+        with torch.inference_mode():
+            model(
+                input_ids=input_ids,
+                use_cache=False,
+                logits_to_keep=1
+            )
+
+    torch.cuda.synchronize()
+    t0=time.perf_counter()
+
+    for _ in range(20):
+        with torch.inference_mode():
+            model(
+                input_ids=input_ids,
+                use_cache=False,
+                logits_to_keep=1
+            )
+
+    torch.cuda.synchronize()
+    t1=time.perf_counter()
+
+    total=(t1-t0)/20
+    print(
+        "batch size:",batch_size,
+        "total time:",total*1000,"ms",
+        "time per sequence:",total/batch_size*1000,"ms"
+    )
+
+
+#kv_cache_decode.py
+import torch
+from transformers import AutoTokenizer,AutoModelForCausalLM
+model_name="Qwen/Qwen2.5-0.5B-Instruct"
+tokenizer=AutoTokenizer.from_pretrained(model_name)
+model=AutoModelForCausalLM.from_pretrained(
+    model_name,
+    dtype=torch.float16,
+    device_map="cuda"
+)
+model.eval()
+def kv_prefill(prompt):
+    messages=[
+        {
+            "role":"user",
+            "content":prompt,
+        }
+    ]
+    text=tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+    inputs=tokenizer(
+        text,
+        return_tensors="pt"
+    ).to(model.device)
+    with torch.inference_mode():
+        outputs=model(
+            input_ids=inputs["input_ids"],
+            use_cache=True,
+            logits_to_keep=1
+        )
+    cache=outputs.past_key_values
+    logits=outputs.logits[:,-1,:]
+
+    next_token=torch.argmax(
+        logits,
+        dim=-1,
+        keepdim=True
+    )
+    print("prompt length:",inputs["input_ids"].shape[1])
+    print("cache length:",cache.get_seq_length())
+    print("first token:",next_token.item())
+    print("cache check:",cache.get_seq_length()==inputs["input_ids"].shape[1])
+    return inputs["input_ids"],next_token,cache
+
+prompt="explain machine learning in one sentence."
+prefill_input_ids,next_token,cache=kv_prefill(prompt)
+generated_tokens=[next_token.item()]
+eos_token_ids=model.generation_config.eos_token_id
+if isinstance(eos_token_ids,int):
+    eos_token_ids=[eos_token_ids]
+for step in range(1,50):
+    current_position=cache.get_seq_length()
+    position_ids=torch.tensor(
+        [[current_position]],
+        device=model.device
+    )
+    attention_mask=torch.ones(
+        (1,current_position+1),
+        dtype=torch.long,
+        device=model.device
+    )
+    with torch.inference_mode():
+        outputs=model(
+            input_ids=next_token,
+            past_key_values=cache,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
+            logits_to_keep=1
+        )
+    next_token=torch.argmax(
+        outputs.logits[:,-1,:],
+        dim=-1,
+        keepdim=True
+    )
+    generated_tokens.append(next_token.item())
+    if next_token.item() in eos_token_ids:
+        break
+print("generated tokens:",generated_tokens)
+print("number of generated tokens:",len(generated_tokens))
+print("final cache length:",cache.get_seq_length())
+response=tokenizer.decode(
+    generated_tokens,
+    skip_special_tokens=True
+)
+print("response:",response)
+
+#benchmark_kv.py
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import time
+import matplotlib.pyplot as plt
+# load model
+model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    dtype=torch.float16,
+    device_map="cuda"
+)
+model.eval()
+#prepare prompt
+prompt = "explain machine learning in one sentence."
+messages = [
+    {
+        "role": "user",
+        "content": prompt
+    }
+]
+text = tokenizer.apply_chat_template(
+    messages,
+    tokenize=False,
+    add_generation_prompt=True
+)
+inputs = tokenizer(
+    text,
+    return_tensors="pt"
+).to(model.device)
+input_ids = inputs["input_ids"]
+max_new_tokens = 30
+#uncached decoder
+def benchmark_uncached():
+    current_ids = input_ids.clone()
+    step_times = []
+    # Warmup
+    for _ in range(3):
+        with torch.inference_mode():
+            model(
+                input_ids=current_ids,
+                use_cache=False,
+                logits_to_keep=1
+            )
+    torch.cuda.synchronize()
+    for step in range(max_new_tokens):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        with torch.inference_mode():
+            outputs = model(
+                input_ids=current_ids,
+                use_cache=False,
+                logits_to_keep=1
+            )
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        step_times.append((t1 - t0) * 1000)
+        logits = outputs.logits[:, -1, :]
+        next_token = torch.argmax(
+            logits,
+            dim=-1,
+            keepdim=True
+        )
+        current_ids = torch.cat(
+            [current_ids, next_token],
+            dim=1
+        )
+    return step_times
+#kv cache decoder
+def benchmark_cached():
+    # Prefill
+    with torch.inference_mode():
+        outputs = model(
+            input_ids=input_ids,
+            use_cache=True,
+            logits_to_keep=1
+        )
+    cache = outputs.past_key_values
+    next_token = torch.argmax(
+        outputs.logits[:, -1, :],
+        dim=-1,
+        keepdim=True
+    )
+    step_times = []
+    # Warmup cached decode
+    warmup_cache = cache
+    for _ in range(3):
+        current_position = warmup_cache.get_seq_length()
+        position_ids = torch.tensor(
+            [[current_position]],
+            device=model.device
+        )
+        attention_mask = torch.ones(
+            (1, current_position + 1),
+            dtype=torch.long,
+            device=model.device
+        )
+        with torch.inference_mode():
+            model(
+                input_ids=next_token,
+                past_key_values=warmup_cache,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                use_cache=True,
+                logits_to_keep=1
+            )
+    # Re-run prefill so timing starts with a fresh cache
+    with torch.inference_mode():
+        outputs = model(
+            input_ids=input_ids,
+            use_cache=True,
+            logits_to_keep=1
+        )
+    cache = outputs.past_key_values
+    next_token = torch.argmax(
+        outputs.logits[:, -1, :],
+        dim=-1,
+        keepdim=True
+    )
+    torch.cuda.synchronize()
+    for step in range(max_new_tokens - 1):
+        current_position = cache.get_seq_length()
+        position_ids = torch.tensor(
+            [[current_position]],
+            device=model.device
+        )
+        attention_mask = torch.ones(
+            (1, current_position + 1),
+            dtype=torch.long,
+            device=model.device
+        )
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        with torch.inference_mode():
+            outputs = model(
+                input_ids=next_token,
+                past_key_values=cache,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                use_cache=True,
+                logits_to_keep=1
+            )
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        step_times.append((t1 - t0) * 1000)
+        next_token = torch.argmax(
+            outputs.logits[:, -1, :],
+            dim=-1,
+            keepdim=True
+        )
+    return step_times
+#run benchmarks
+uncached_times = benchmark_uncached()
+cached_times = benchmark_cached()
+#print results
+print("\nUncached:")
+print("Average:", sum(uncached_times) / len(uncached_times), "ms/token")
+print("Total:", sum(uncached_times), "ms")
+print("\nKV cached:")
+print("Average:", sum(cached_times) / len(cached_times), "ms/token")
+print("Total:", sum(cached_times), "ms")
+speedup = (
+    sum(uncached_times) / len(uncached_times)
+) / (
+    sum(cached_times) / len(cached_times)
+)
+print("\nAverage speedup:", speedup, "x")
+#plot
+plt.figure(figsize=(10, 6))
+plt.plot(
+    range(1, len(uncached_times) + 1),
+    uncached_times,
+    label="Uncached"
+)
+plt.plot(
+    range(1, len(cached_times) + 1),
+    cached_times,
+    label="KV Cache"
+)
+plt.xlabel("Generation step")
+plt.ylabel("Forward-pass latency (ms)")
+plt.title("Uncached vs KV-Cache Decoding")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
